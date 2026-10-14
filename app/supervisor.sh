@@ -1,120 +1,176 @@
 #!/bin/bash
-# Runs as root. Starts OmniRoute -> launcher; OpenClaw starts only on command from the launcher.
-set -uo pipefail
-set -a; . /run/agent.env; set +a
-
-VOL=/vol
+set -Eeuo pipefail
+umask 077
+APP=/opt/app
 CTL=/run/ctl
 LOG=/var/log/agent
-APP=/opt/app
-OC_HOME=/home/openclaw
-PATHV="$PATH"
-
+VOL=/vol
+export PATH="/opt/runtime/node_modules/.bin:$PATH"
 exec 9>/run/supervisor.lock
-flock -n 9 || { echo "supervisor already running"; exit 0; }
 
-mkdir -p "$CTL" "$LOG"
+if [ "${1:-}" = --stop ]; then
+  if flock -n 9; then exit 0; fi
+  touch /run/onvix.stop
+  flock -w 480 9 || { echo 'Supervisor shutdown/backup timed out; inspect logs' >&2; exit 1; }
+  [ "$(cat /run/onvix-stop-result 2>/dev/null || echo 1)" = 0 ] || { echo 'Final backup failed; preserve this sandbox' >&2; exit 1; }
+  exit 0
+fi
+flock -n 9 || { echo 'Supervisor already running'; exit 0; }
+[ "$(id -u)" = 0 ] || { echo 'Supervisor requires root'; exit 1; }
+[ -s /run/agent.env ] || { echo 'Missing /run/agent.env'; exit 1; }
+set -a
+# shellcheck source=/dev/null
+. /run/agent.env
+set +a
+for key in OMNIROUTE_PASSWORD JWT_SECRET API_KEY_SECRET STORAGE_ENCRYPTION_KEY LAUNCHER_TOKEN OPENCLAW_GATEWAY_TOKEN; do
+  [ -n "${!key:-}" ] || { echo "Missing $key" >&2; exit 1; }
+done
+node "$APP/verify-runtime.mjs"
+mountpoint -q "$VOL" || { echo '/vol is not mounted; refusing ephemeral-only state'; exit 1; }
+python3 "$APP/backup.py" verify-key
+mkdir -p "$CTL" "$LOG" /var/lib/onvix
 chown launcher:launcher "$CTL"
-
-# local dir <-> volume dir (volume is FUSE, so live DBs stay on local disk and are synced)
-SYNC=(
-  "omniroute:/home/omniroute/data:$VOL/omniroute"
-  "openclaw:$OC_HOME/.openclaw:$VOL/openclaw"
-  "launcher:/home/launcher/state:$VOL/launcher"
-)
-
-restore() {
-  local u l v
-  for e in "${SYNC[@]}"; do
-    IFS=: read -r u l v <<<"$e"
-    mkdir -p "$l"
-    [ -d "$v" ] && rsync -a "$v"/ "$l"/
-    chown -R "$u:$u" "$l"
-  done
+chmod 750 "$CTL"
+rm -f /run/onvix.stop /run/onvix-stop-result "$CTL/cmd.processing"
+printf '%s\n' "$$" > /run/onvix.pid
+restored=0
+backup_pid=''
+status() { printf '%s\n' "$1" > "$CTL/.status.tmp"; chmod 644 "$CTL/.status.tmp"; mv "$CTL/.status.tmp" "$CTL/status"; }
+stop_user() {
+  local user="$1"
+  pkill -TERM -u "$user" 2>/dev/null || true
+  for _ in $(seq 40); do pgrep -u "$user" >/dev/null || return 0; sleep .5; done
+  pkill -KILL -u "$user" 2>/dev/null || true
 }
-
-backup() {
-  local u l v
-  mountpoint -q "$VOL" || return 0
-  for e in "${SYNC[@]}"; do
-    IFS=: read -r u l v <<<"$e"
-    mkdir -p "$v"
-    rsync -a --delete --exclude '*.log' "$l"/ "$v"/ 2>>"$LOG/backup.err"
-  done
+backup() { timeout 180 python3 "$APP/backup.py" backup >>"$LOG/backup.log" 2>&1; }
+cleanup() {
+  local code=$?
+  trap - EXIT INT TERM
+  set +e
+  status stopping
+  stop_user openclaw
+  stop_user launcher
+  stop_user omniroute
+  if [ -n "$backup_pid" ]; then wait "$backup_pid"; fi
+  if [ "$restored" = 1 ]; then
+    if ! backup; then echo 'Final backup FAILED; do not delete this sandbox' >&2; code=1; fi
+  fi
+  status stopped
+  rm -f /run/onvix.pid "$CTL/supervisor-alive" /run/onvix.stop
+  printf '%s\n' "$code" > /run/onvix-stop-result
+  exit "$code"
 }
+trap cleanup EXIT
+trap 'exit 0' INT TERM
 
-as() { # as <user> <KEY=VAL...> -- <cmd...>   (clean environment per service)
-  local u="$1"; shift
-  runuser -u "$u" -- env -i PATH="$PATHV" HOME="/home/$u" "$@"
+if [ ! -f /var/lib/onvix/restored ]; then
+  python3 "$APP/backup.py" restore
+  touch /var/lib/onvix/restored
+fi
+for pair in omniroute:data openclaw:.openclaw launcher:state; do
+  user=${pair%%:*}; dir="/home/$user/${pair#*:}"
+  mkdir -p "$dir"
+  chown -R "$user:$user" "$dir"
+  chmod 700 "$dir"
+done
+restored=1
+
+as() {
+  local user="$1"; shift
+  # Children must NOT inherit the supervisor's flock descriptor or root secrets.
+  (cd "/home/$user" && exec runuser -u "$user" -- env -i PATH="$PATH" HOME="/home/$user" "$@" 9>&-)
 }
-
 omni_start() {
-  as omniroute DATA_DIR=/home/omniroute/data PORT=20128 HOSTNAME=0.0.0.0 NODE_ENV=production \
+  as omniroute DATA_DIR=/home/omniroute/data PORT=20128 NODE_ENV=production \
     INITIAL_PASSWORD="$OMNIROUTE_PASSWORD" JWT_SECRET="$JWT_SECRET" API_KEY_SECRET="$API_KEY_SECRET" \
     STORAGE_ENCRYPTION_KEY="$STORAGE_ENCRYPTION_KEY" MACHINE_ID_SALT="$API_KEY_SECRET" \
     OMNIROUTE_WS_BRIDGE_SECRET="$JWT_SECRET" AUTH_COOKIE_SECURE=true REQUIRE_API_KEY=true \
     BASE_URL=http://127.0.0.1:20128 NEXT_PUBLIC_BASE_URL="$DASHBOARD_URL" \
-    omniroute >>"$LOG/omniroute.log" 2>&1 &
+    bash "$APP/start-omniroute.sh" >>"$LOG/omniroute.log" 2>&1 &
+  omni_pid=$!
 }
-
 launcher_start() {
   as launcher STATE_DIR=/home/launcher/state CTL_DIR="$CTL" LAUNCHER_TOKEN="$LAUNCHER_TOKEN" \
     CONTROL_BOT_TOKEN="$CONTROL_BOT_TOKEN" OPENCLAW_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" OWNER_ID="$OWNER_ID" \
     TG_CHAT_ID="$TG_CHAT_ID" TG_TOPIC_CODING="$TG_TOPIC_CODING" TG_TOPIC_WRITING="$TG_TOPIC_WRITING" \
     TG_TOPIC_VIDEO="$TG_TOPIC_VIDEO" DASHBOARD_URL="$DASHBOARD_URL" LAUNCHER_URL="$LAUNCHER_URL" \
-    GATEWAY_URL="$GATEWAY_URL" node "$APP/launcher.mjs" >>"$LOG/launcher.log" 2>&1 &
+    node "$APP/launcher.mjs" >>"$LOG/launcher.log" 2>&1 &
 }
-
 oc_start() {
-  node "$APP/render-config.mjs" >>"$LOG/render.log" 2>&1 || { echo "render failed" >"$CTL/status"; return 1; }
-  chown -R openclaw:openclaw "$OC_HOME/.openclaw" "$OC_HOME/.drive" 2>/dev/null
+  status starting
+  if ! node "$APP/render-config.mjs" >>"$LOG/render.log" 2>&1; then status config-error; return 1; fi
+  chown -R openclaw:openclaw /home/openclaw/.openclaw /home/openclaw/.drive
+  if ! as openclaw OPENCLAW_GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN" TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
+    openclaw config validate >>"$LOG/render.log" 2>&1; then status config-error; return 1; fi
   as openclaw OPENCLAW_GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN" TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
     NODE_ENV=production openclaw gateway run >>"$LOG/openclaw.log" 2>&1 &
 }
-
-janitor() { # age-based, so a running job is never touched; keeps sessions/config/skills
-  local m="${JANITOR_MAX_AGE_MIN:-180}"
-  find "$OC_HOME"/.openclaw/workspace-*/work -mindepth 1 -mmin +"$m" -delete 2>/dev/null
-  find /tmp /var/tmp -xdev -mindepth 1 \( -user openclaw -o -user launcher \) -mmin +"$m" -delete 2>/dev/null
-  find "$OC_HOME"/.cache "$OC_HOME"/.npm/_logs -mindepth 1 -mmin +"$m" -delete 2>/dev/null
-  for f in "$LOG"/*.log; do [ "$(stat -c %s "$f" 2>/dev/null || echo 0)" -gt 20971520 ] && tail -c 2097152 "$f" >"$f.tmp" && cat "$f.tmp" >"$f" && rm -f "$f.tmp"; done
-  true
-}
-
-oc_stop() { pkill -TERM -u openclaw; sleep 3; pkill -KILL -u openclaw 2>/dev/null; true; }
-
 alive() { pgrep -u "$1" >/dev/null; }
-
-cleanup() {
-  oc_stop; pkill -TERM -u launcher; pkill -TERM -u omniroute
-  for _ in $(seq 40); do alive omniroute || break; sleep 1; done
-  backup; exit 0
+probe() { curl --fail --silent --show-error --max-time 3 "$1" >/dev/null 2>&1; }
+wait_omni() {
+  for _ in $(seq 90); do
+    [ ! -e /run/onvix.stop ] || exit 0
+    touch "$CTL/supervisor-alive"; chmod 644 "$CTL/supervisor-alive"
+    if probe http://127.0.0.1:20128/api/monitoring/health; then return 0; fi
+    kill -0 "$omni_pid" 2>/dev/null || return 1
+    sleep 2
+  done
+  return 1
 }
-trap cleanup TERM INT
-
-restore
+status stopped
 omni_start
-for _ in $(seq 90); do curl -s -o /dev/null "http://127.0.0.1:20128/" && break; sleep 2; done
+if ! wait_omni; then
+  echo 'OmniRoute startup failed. Full error: /var/log/agent/omniroute.log' >&2
+  exit 1
+fi
 launcher_start
-
-want_oc=0
-[ -f /home/launcher/state/started ] && want_oc=1 && oc_start
-last=$(date +%s); lastj=$last
-
-while true; do
-  if [ -f "$CTL/cmd" ]; then
-    cmd=$(cat "$CTL/cmd"); rm -f "$CTL/cmd"
-    case "$cmd" in
-      start|restart) oc_stop; want_oc=1; oc_start ;;
-      stop) want_oc=0; oc_stop ;;
-    esac
-  fi
-  alive omniroute || omni_start
-  alive launcher  || launcher_start
-  if [ "$want_oc" = 1 ] && ! alive openclaw; then sleep 10; oc_start; fi
-  if alive openclaw; then echo running >"$CTL/status"; else echo stopped >"$CTL/status"; fi
+# Backoff stops permanent configuration/package errors becoming a tight crash loop.
+declare -A retry_at=([omniroute]=0 [launcher]=0 [openclaw]=0)
+declare -A delay=([omniroute]=5 [launcher]=5 [openclaw]=5)
+last_backup=$(date +%s)
+last_rotate=$last_backup
+while [ ! -e /run/onvix.stop ]; do
+  touch "$CTL/supervisor-alive"; chmod 644 "$CTL/supervisor-alive"
   now=$(date +%s)
-  if [ $((now - last)) -ge 30 ]; then backup; last=$now; fi
-  if [ $((now - lastj)) -ge 600 ]; then janitor; lastj=$now; fi
-  sleep 2 & wait $!
+  if [ -f "$CTL/cmd" ] && mv "$CTL/cmd" "$CTL/cmd.processing"; then
+    cmd=$(cat "$CTL/cmd.processing")
+    case "$cmd" in
+      start|restart) stop_user openclaw; status starting; retry_at[openclaw]=0; delay[openclaw]=5 ;;
+      stop) stop_user openclaw; status stopped ;;
+    esac
+    rm -f "$CTL/cmd.processing"
+  fi
+  for service in omniroute launcher openclaw; do
+    if [ "$service" = openclaw ] && [ ! -f /home/launcher/state/started ]; then
+      if alive openclaw; then stop_user openclaw; fi
+      status stopped
+      continue
+    fi
+    if ! alive "$service" && (( now >= retry_at[$service] )); then
+      case "$service" in
+        omniroute) omni_start ;;
+        launcher) launcher_start ;;
+        openclaw) if probe http://127.0.0.1:20128/api/monitoring/health; then oc_start || true; fi ;;
+      esac
+      retry_at[$service]=$((now + delay[$service]))
+      delay[$service]=$((delay[$service] < 150 ? delay[$service] * 2 : 300))
+    fi
+  done
+  if [ -f /home/launcher/state/started ] && alive openclaw; then
+    if probe http://127.0.0.1:18789/readyz; then status running; delay[openclaw]=5
+    else status not-ready; fi
+  fi
+  if [ -n "$backup_pid" ] && ! kill -0 "$backup_pid" 2>/dev/null; then
+    if ! wait "$backup_pid"; then echo 'Periodic backup failed; see backup.log' >&2; fi
+    backup_pid=''
+  fi
+  if (( now - last_backup >= 300 )) && [ -z "$backup_pid" ]; then
+    backup 9>&- & backup_pid=$!; last_backup=$now
+  fi
+  if (( now - last_rotate >= 60 )); then
+    logrotate -s /var/lib/onvix/logrotate.state "$APP/logrotate.conf" || true
+    last_rotate=$now
+  fi
+  # Never age-delete active workspaces or arbitrary /tmp files.
+  sleep 2 & wait $! || true
 done

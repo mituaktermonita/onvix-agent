@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!runtime/
+!runtime/package.json
+!runtime/package-lock.json
+!app/
+!app/**
+!scripts/
+!scripts/image-smoke.sh
+!scripts/supervisor-smoke.sh
+!scripts/verify-runtime.mjs
+!tests/
+!tests/image-config.mjs

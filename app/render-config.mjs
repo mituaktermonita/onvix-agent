@@ -1,11 +1,15 @@
 // Runs as root before each OpenClaw start. Writes openclaw.json, agent workspaces, Drive credentials.
 import fs from "node:fs";
-import path from "node:path";
+import { atomicWrite, validateKeys } from "./files.mjs";
 
 const e = process.env;
-const HOME = "/home/openclaw";
+const HOME = e.OPENCLAW_HOME || "/home/openclaw";
+const APP = e.APP_DIR || "/opt/app";
 const OC = `${HOME}/.openclaw`;
-const keys = JSON.parse(fs.readFileSync("/home/launcher/state/keys.json", "utf8"));
+const keys = validateKeys(JSON.parse(fs.readFileSync(e.KEYS_FILE || "/home/launcher/state/keys.json", "utf8")));
+for (const key of ["OWNER_ID", "TG_CHAT_ID", "TG_TOPIC_CODING", "TG_TOPIC_WRITING", "TG_TOPIC_VIDEO", "GATEWAY_URL"]) {
+  if (!e[key]) throw new Error(`Missing ${key}`);
+}
 
 const agents = {
   coding: {
@@ -27,26 +31,28 @@ const agents = {
 };
 
 const MAIN_PROMPT =
-  "You are the main Onvix agent. You have exactly three sub-agents: coding (builds anything), writing (any kind of writing), video (video work). Understand the user's request here, delegate each task to the right sub-agent, and report back. Tasks run strictly one at a time in the order received.";
+  "You are the main Onvix agent. You have exactly three sub-agents: coding (builds anything), writing (any kind of writing), video (video work). Understand the user's request here, delegate each task to the right sub-agent, and report back. Delegate one task at a time and wait for its result before delegating the next.";
 
 const cfg = {
   gateway: {
     port: 18789,
-    bind: "loopback",
+    mode: "local",
+    bind: "lan",
     auth: { mode: "token", token: "${OPENCLAW_GATEWAY_TOKEN}" },
-    trustedProxies: ["127.0.0.1"],
     controlUi: { allowedOrigins: [e.GATEWAY_URL] },
   },
-  // one job at a time across all agents; extra requests wait in a FIFO queue and run in order
+  // Limit main and subagent lanes; this is NOT a durable global FIFO across every lane.
   messages: { queue: { mode: "followup", cap: 50, drop: "summarize" } },
   models: { mode: "merge", providers: {} },
-  agents: { defaults: { maxConcurrent: 1, subagents: { maxConcurrent: 1 } }, entries: {} },
+  agents: { ownership: "explicit", defaults: { maxConcurrent: 1, subagents: { maxConcurrent: 1 }, heartbeat: { agentId: "main" }, systemAgent: { agentId: "main" } }, entries: {} },
+  bindings: [{ agentId: "main", match: { channel: "telegram", accountId: "default" } }],
   channels: {
     telegram: {
       enabled: true,
       botToken: "${TELEGRAM_BOT_TOKEN}",
       dmPolicy: "allowlist",
-      allowFrom: [Number(e.OWNER_ID)],
+      allowFrom: [e.OWNER_ID],
+      groupAllowFrom: [e.OWNER_ID],
       groupPolicy: "allowlist",
       groups: { [e.TG_CHAT_ID]: { requireMention: false, topics: {} } },
     },
@@ -54,9 +60,10 @@ const cfg = {
 };
 
 const RULES =
-  " Rules for every job: follow the user's instructions exactly; do one job at a time (further requests are queued for you automatically); do all scratch work inside ./work; when the job is done, upload the deliverable to Drive (the upload deletes the local copy), delete everything else you created in ./work and any temp files, caches or downloads, and then report the result.";
+  " Rules for every job: follow the user's instructions exactly; finish the current job before starting another; do all scratch work inside ./work; when the job is done, upload the deliverable to Drive (the upload deletes the local copy), delete everything else you created in ./work and any temp files, caches or downloads, and then report the result.";
 
-fs.mkdirSync(`${OC}/workspace-main`, { recursive: true });
+fs.mkdirSync(`${OC}/workspace-main/work`, { recursive: true, mode: 0o700 });
+atomicWrite(`${OC}/workspace-main/AGENTS.md`, MAIN_PROMPT + "\n");
 cfg.agents.entries.main = {
   name: "Main Agent",
   workspace: `${OC}/workspace-main`,
@@ -72,10 +79,11 @@ for (const [id, a] of Object.entries(agents)) {
   const ws = `${OC}/workspace-${id}`;
   fs.mkdirSync(`${ws}/work`, { recursive: true });
   fs.mkdirSync(`${ws}/skills/drive`, { recursive: true });
-  fs.copyFileSync("/opt/app/skills/drive/drive.mjs", `${ws}/skills/drive/drive.mjs`);
+  atomicWrite(`${ws}/AGENTS.md`, a.prompt + "\n");
+  fs.copyFileSync(`${APP}/skills/drive/drive.mjs`, `${ws}/skills/drive/drive.mjs`);
   fs.writeFileSync(
     `${ws}/skills/drive/SKILL.md`,
-    fs.readFileSync("/opt/app/skills/drive/SKILL.md", "utf8").replaceAll("{{AGENT}}", id).replaceAll("{{WS}}", ws),
+    fs.readFileSync(`${APP}/skills/drive/SKILL.md`, "utf8").replaceAll("{{AGENT}}", id).replaceAll("{{WS}}", ws),
   );
   fs.mkdirSync(`${HOME}/.drive`, { recursive: true, mode: 0o700 });
   fs.writeFileSync(
@@ -106,10 +114,9 @@ for (const [id, a] of Object.entries(agents)) {
 }
 
 fs.mkdirSync(OC, { recursive: true });
-fs.writeFileSync(`${OC}/openclaw.json`, JSON.stringify(cfg, null, 2));
+atomicWrite(`${OC}/openclaw.json`, JSON.stringify(cfg, null, 2));
 // OpenClaw reads ~/.openclaw/.env as a global fallback; holds only the per-agent OmniRoute keys
-fs.writeFileSync(
+atomicWrite(
   `${OC}/.env`,
   ["CODING", "WRITING", "VIDEO"].map((n) => `OMNI_KEY_${n}=${keys[n.toLowerCase()]}`).join("\n") + "\n",
-  { mode: 0o600 },
 );

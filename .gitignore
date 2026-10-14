@@ -1,1 +1,15 @@
 .env
+.env.*
+!.env.example
+.venv/
+.cache/
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+
+# Release-only helper files in the extracted ZIP
+/apply_update.py
+/MANIFEST.json
+/START-HERE-BN.txt
