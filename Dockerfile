@@ -1,4 +1,4 @@
-FROM node:24-bookworm-slim
+FROM node:20-bookworm-slim
 
 ARG OPENCLAW_VERSION=2026.9.8
 ARG OMNIROUTE_VERSION=3.8.51
