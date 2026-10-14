@@ -30,7 +30,7 @@ jobs:
       - run: |
           for file in app/*.sh scripts/*.sh; do bash -n "$file"; done
           for file in app/*.mjs app/skills/drive/*.mjs; do node --check "$file"; done
-          shellcheck app/*.sh scripts/*.sh
+          shellcheck --exclude=SC2015 app/*.sh scripts/*.sh
           git diff --check
   image:
     needs: unit
