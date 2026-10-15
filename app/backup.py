@@ -1,3 +1,8 @@
+import shutil
+import os
+def _replace(src, dst):
+    shutil.copyfile(src, dst)
+    os.remove(src)
 #!/usr/bin/env python3
 """Single-writer volume snapshots; SQLite online backup, never raw live WAL copies.
 
@@ -75,7 +80,7 @@ def verify_encryption_key(volume, secret):
     else:
         temporary = volume / ".encryption-key.tmp"
         temporary.write_text(fingerprint + "\n")
-        shutil.move(temporary, marker)
+        _replace(temporary, marker)
 
 
 def snapshot(volume, sources=SOURCES):
@@ -90,7 +95,7 @@ def snapshot(volume, sources=SOURCES):
     (target / "complete.json").write_text(json.dumps({"version": 1, "services": list(sources)}))
     temporary = volume / ".CURRENT.tmp"
     temporary.write_text(name + "\n")
-    shutil.move(temporary, volume / "CURRENT")
+    _replace(temporary, volume / "CURRENT")
     complete = sorted(p for p in snapshots.iterdir() if p.is_dir() and (p / "complete.json").exists())
     for old in complete[:-3]:
         shutil.rmtree(old)
