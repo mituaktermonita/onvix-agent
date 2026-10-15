@@ -75,7 +75,7 @@ def verify_encryption_key(volume, secret):
     else:
         temporary = volume / ".encryption-key.tmp"
         temporary.write_text(fingerprint + "\n")
-        os.replace(temporary, marker)
+        shutil.move(temporary, marker)
 
 
 def snapshot(volume, sources=SOURCES):
@@ -90,7 +90,7 @@ def snapshot(volume, sources=SOURCES):
     (target / "complete.json").write_text(json.dumps({"version": 1, "services": list(sources)}))
     temporary = volume / ".CURRENT.tmp"
     temporary.write_text(name + "\n")
-    os.replace(temporary, volume / "CURRENT")
+    shutil.move(temporary, volume / "CURRENT")
     complete = sorted(p for p in snapshots.iterdir() if p.is_dir() and (p / "complete.json").exists())
     for old in complete[:-3]:
         shutil.rmtree(old)
